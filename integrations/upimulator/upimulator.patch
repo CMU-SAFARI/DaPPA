@@ -1,0 +1,337 @@
+diff --git a/benchmark/CMakeLists.txt b/benchmark/CMakeLists.txt
+index 30998a1..4576fdf 100644
+--- a/benchmark/CMakeLists.txt
++++ b/benchmark/CMakeLists.txt
+@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.16)
+ project(benchmark)
+ 
+ add_subdirectory(BS)
++add_subdirectory(DAPPA)
+ add_subdirectory(GEMV)
+ add_subdirectory(HST-L)
+ add_subdirectory(HST-S)
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index 2a1789b..66b203f 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -1,20 +1,22 @@
+-FROM ubuntu:22.04
+-
+-ENV DEBIAN_FRONTEND=noninteractive
+-
+-RUN apt update
+-RUN apt install -y git
+-RUN apt install -y wget
+-RUN apt install -y cmake
+-RUN apt install -y ninja-build
+-RUN apt install -y pkg-config
+-RUN apt install -y python3
+-RUN apt install -y python3-pip
+-
+-# UPMEM SDK
+-WORKDIR /root
+-RUN wget sdk-releases.upmem.com/2023.2.0/ubuntu_22.04/upmem-2023.2.0-Linux-x86_64.tar.gz
+-RUN tar -zxvf upmem-2023.2.0-Linux-x86_64.tar.gz
+-RUN echo "source /root/upmem-2023.2.0-Linux-x86_64/upmem_env.sh" > /root/.bashrc
+-
+-WORKDIR /root/uPIMulator
++FROM ubuntu:22.04
++
++ENV DEBIAN_FRONTEND=noninteractive
++
++RUN apt update
++RUN apt install -y git
++RUN apt install -y wget
++RUN apt install -y cmake
++RUN apt install -y ninja-build
++RUN apt install -y pkg-config
++RUN apt install -y python3
++RUN apt install -y python3-pip
++
++# UPMEM SDK. The original download location is offline, so use the SDK
++# archived by SAFARI, installed at the path the benchmarks expect.
++WORKDIR /root
++RUN git clone --depth 1 https://github.com/CMU-SAFARI/UPMEM.git /tmp/UPMEM && \
++    mv /tmp/UPMEM/upmem-2023.1.0-Linux-x86_64 /root/upmem-2023.2.0-Linux-x86_64 && \
++    rm -rf /tmp/UPMEM
++RUN echo "source /root/upmem-2023.2.0-Linux-x86_64/upmem_env.sh" > /root/.bashrc
++
++WORKDIR /root/uPIMulator
+diff --git a/src/assembler/assembler.go b/src/assembler/assembler.go
+index 0b26695..7df72c0 100644
+--- a/src/assembler/assembler.go
++++ b/src/assembler/assembler.go
+@@ -51,6 +51,9 @@ func (this *Assembler) Init(command_line_parser *misc.CommandLineParser) {
+ 	this.assemblables["UNI"] = new(prim.Uni)
+ 	this.assemblables["VA"] = new(prim.Va)
+ 
++	// Generic consumer for DaPPA pipelines emitted with DAPPA_EMIT_RECIPE.
++	this.assemblables["DAPPA"] = new(prim.Dappa)
++
+ 	if assemblable, found := this.assemblables[this.benchmark]; found {
+ 		assemblable.Init(command_line_parser)
+ 	} else {
+diff --git a/src/linker/kernel/instruction/instruction.go b/src/linker/kernel/instruction/instruction.go
+index e37a656..dfe237f 100644
+--- a/src/linker/kernel/instruction/instruction.go
++++ b/src/linker/kernel/instruction/instruction.go
+@@ -2784,7 +2784,7 @@ func (this *Instruction) EncodeSRrr(word_ *word.Word) {
+ 		panic(err)
+ 	}
+ 
+-	if this.suffix != RRR {
++	if this.suffix != S_RRR && this.suffix != U_RRR {
+ 		err := errors.New("suffix is not S_RRR nor U_RRR")
+ 		panic(err)
+ 	}
+@@ -4855,7 +4855,7 @@ func (this *Instruction) DecodeSRrr(word_ *word.Word) {
+ 		panic(err)
+ 	}
+ 
+-	if this.suffix != S_RRR {
++	if this.suffix != S_RRR && this.suffix != U_RRR {
+ 		err := errors.New("suffix is not S_RRR nor U_RRR")
+ 		panic(err)
+ 	}
+diff --git a/src/simulator/dpu/logic/logic.go b/src/simulator/dpu/logic/logic.go
+index 32de3e3..6671ba3 100644
+--- a/src/simulator/dpu/logic/logic.go
++++ b/src/simulator/dpu/logic/logic.go
+@@ -3662,8 +3662,157 @@ func (this *Logic) ExecuteSRrif(instruction_ *instruction.Instruction) {
+ }
+ 
+ func (this *Logic) ExecuteSRrr(instruction_ *instruction.Instruction) {
+-	err := errors.New("ExecuteSRrr is not yet implemented")
+-	panic(err)
++	if _, found := instruction_.RrrOpCodes()[instruction_.OpCode()]; !found {
++		err := errors.New("op code is not a valid RRR op code")
++		panic(err)
++	} else if instruction_.Suffix() != instruction.S_RRR && instruction_.Suffix() != instruction.U_RRR {
++		err := errors.New("suffix is not S_RRR nor U_RRR")
++		panic(err)
++	}
++
++	thread := this.scoreboard[instruction_]
++
++	ra := thread.RegFile().ReadSrcReg(instruction_.Ra(), word.SIGNED)
++	rb := thread.RegFile().ReadSrcReg(instruction_.Rb(), word.SIGNED)
++
++	var result int64
++	var carry bool
++
++	op_code := instruction_.OpCode()
++	if op_code == instruction.ADD {
++		result, carry, _ = this.alu.Add(ra, rb)
++	} else if op_code == instruction.ADDC {
++		carry_flag := thread.RegFile().ReadFlagReg(instruction.CARRY)
++		result, carry, _ = this.alu.Addc(ra, rb, carry_flag)
++	} else if op_code == instruction.AND {
++		result = this.alu.And(ra, rb)
++		carry = false
++	} else if op_code == instruction.ANDN {
++		result = this.alu.Andn(ra, rb)
++		carry = false
++	} else if op_code == instruction.ASR {
++		result = this.alu.Asr(ra, rb)
++		carry = false
++	} else if op_code == instruction.CMPB4 {
++		result = this.alu.Cmpb4(ra, rb)
++		carry = false
++	} else if op_code == instruction.LSL {
++		result = this.alu.Lsl(ra, rb)
++		carry = false
++	} else if op_code == instruction.LSL1 {
++		result = this.alu.Lsl1(ra, rb)
++		carry = false
++	} else if op_code == instruction.LSL1X {
++		result = this.alu.Lsl1x(ra, rb)
++		carry = false
++	} else if op_code == instruction.LSLX {
++		result = this.alu.Lslx(ra, rb)
++		carry = false
++	} else if op_code == instruction.LSR {
++		result = this.alu.Lsr(ra, rb)
++		carry = false
++	} else if op_code == instruction.LSR1 {
++		result = this.alu.Lsr1(ra, rb)
++		carry = false
++	} else if op_code == instruction.LSR1X {
++		result = this.alu.Lsr1x(ra, rb)
++		carry = false
++	} else if op_code == instruction.LSRX {
++		result = this.alu.Lsrx(ra, rb)
++		carry = false
++	} else if op_code == instruction.ROL {
++		result = this.alu.Rol(ra, rb)
++		carry = false
++	} else if op_code == instruction.ROR {
++		result = this.alu.Ror(ra, rb)
++		carry = false
++	} else if op_code == instruction.MUL_SH_SH {
++		result = this.alu.MulShSh(ra, rb)
++		carry = false
++	} else if op_code == instruction.MUL_SH_SL {
++		result = this.alu.MulShSl(ra, rb)
++		carry = false
++	} else if op_code == instruction.MUL_SH_UH {
++		result = this.alu.MulShUh(ra, rb)
++		carry = false
++	} else if op_code == instruction.MUL_SH_UL {
++		result = this.alu.MulShUl(ra, rb)
++		carry = false
++	} else if op_code == instruction.MUL_SL_SH {
++		result = this.alu.MulSlSh(ra, rb)
++		carry = false
++	} else if op_code == instruction.MUL_SL_SL {
++		result = this.alu.MulSlSl(ra, rb)
++		carry = false
++	} else if op_code == instruction.MUL_SL_UH {
++		result = this.alu.MulSlUh(ra, rb)
++		carry = false
++	} else if op_code == instruction.MUL_SL_UL {
++		result = this.alu.MulSlUl(ra, rb)
++		carry = false
++	} else if op_code == instruction.MUL_UH_UH {
++		result = this.alu.MulUhUh(ra, rb)
++		carry = false
++	} else if op_code == instruction.MUL_UH_UL {
++		result = this.alu.MulUhUl(ra, rb)
++		carry = false
++	} else if op_code == instruction.MUL_UL_UH {
++		result = this.alu.MulUlUh(ra, rb)
++		carry = false
++	} else if op_code == instruction.MUL_UL_UL {
++		result = this.alu.MulUlUl(ra, rb)
++		carry = false
++	} else if op_code == instruction.NAND {
++		result = this.alu.Nand(ra, rb)
++		carry = false
++	} else if op_code == instruction.NOR {
++		result = this.alu.Nor(ra, rb)
++		carry = false
++	} else if op_code == instruction.NXOR {
++		result = this.alu.Nxor(ra, rb)
++		carry = false
++	} else if op_code == instruction.OR {
++		result = this.alu.Or(ra, rb)
++		carry = false
++	} else if op_code == instruction.ORN {
++		result = this.alu.Orn(ra, rb)
++		carry = false
++	} else if op_code == instruction.RSUB {
++		result, carry, _ = this.alu.Sub(rb, ra)
++	} else if op_code == instruction.RSUBC {
++		carry_flag := thread.RegFile().ReadFlagReg(instruction.CARRY)
++		result, carry, _ = this.alu.Subc(rb, ra, carry_flag)
++	} else if op_code == instruction.SUB {
++		result, carry, _ = this.alu.Sub(ra, rb)
++	} else if op_code == instruction.SUBC {
++		carry_flag := thread.RegFile().ReadFlagReg(instruction.CARRY)
++		result, carry, _ = this.alu.Subc(ra, rb, carry_flag)
++	} else if op_code == instruction.XOR {
++		result = this.alu.Xor(ra, rb)
++		carry = false
++	} else if op_code == instruction.HASH {
++		result = this.alu.Hash(ra, rb)
++		carry = false
++	} else {
++		err := errors.New("op code is not valid")
++		panic(err)
++	}
++
++	thread.RegFile().ClearConditions()
++
++	var even int64
++	var odd int64
++	if instruction_.Suffix() == instruction.S_RRR {
++		even, odd = this.alu.SignedExtension(result)
++	} else {
++		even, odd = this.alu.UnsignedExtension(result)
++	}
++
++	thread.RegFile().WritePairReg(instruction_.Dc(), even, odd)
++
++	thread.RegFile().IncrementPcReg()
++
++	this.SetFlags(instruction_, result, carry)
+ }
+ 
+ func (this *Logic) ExecuteSRrrc(instruction_ *instruction.Instruction) {
+@@ -4837,8 +4986,50 @@ func (this *Logic) ExecuteErri(instruction_ *instruction.Instruction) {
+ }
+ 
+ func (this *Logic) ExecuteSErri(instruction_ *instruction.Instruction) {
+-	err := errors.New("ExecuteSErri is not yet implemented")
+-	panic(err)
++	if _, found := instruction_.ErriOpCodes()[instruction_.OpCode()]; !found {
++		err := errors.New("op code is not a valid ERRI op code")
++		panic(err)
++	} else if instruction_.Suffix() != instruction.S_ERRI && instruction_.Suffix() != instruction.U_ERRI {
++		err := errors.New("suffix is not S_ERRI nor U_ERRI")
++		panic(err)
++	}
++
++	thread := this.scoreboard[instruction_]
++
++	ra := thread.RegFile().ReadSrcReg(instruction_.Ra(), word.SIGNED)
++	off := instruction_.Off().Value()
++
++	address, _, _ := this.alu.Add(ra, off)
++
++	var result int64
++
++	op_code := instruction_.OpCode()
++	if op_code == instruction.LBS {
++		result = this.operand_collector.Lbs(address)
++	} else if op_code == instruction.LBU {
++		result = this.operand_collector.Lbu(address)
++	} else if op_code == instruction.LHS {
++		result = this.operand_collector.Lhs(address)
++	} else if op_code == instruction.LHU {
++		result = this.operand_collector.Lhu(address)
++	} else if op_code == instruction.LW {
++		result = this.operand_collector.Lw(address)
++	} else {
++		err := errors.New("op code is not valid")
++		panic(err)
++	}
++
++	var even int64
++	var odd int64
++	if instruction_.Suffix() == instruction.S_ERRI {
++		even, odd = this.alu.SignedExtension(result)
++	} else {
++		even, odd = this.alu.UnsignedExtension(result)
++	}
++
++	thread.RegFile().ClearConditions()
++	thread.RegFile().WritePairReg(instruction_.Dc(), even, odd)
++	thread.RegFile().IncrementPcReg()
+ }
+ 
+ func (this *Logic) ExecuteEdri(instruction_ *instruction.Instruction) {
+diff --git a/src/simulator/host/channel_transfer_read_job.go b/src/simulator/host/channel_transfer_read_job.go
+index 9b9c214..02dec0d 100644
+--- a/src/simulator/host/channel_transfer_read_job.go
++++ b/src/simulator/host/channel_transfer_read_job.go
+@@ -2,6 +2,7 @@ package host
+ 
+ import (
+ 	"errors"
++	"os"
+ 	"uPIMulator/src/abi/encoding"
+ 	"uPIMulator/src/simulator/channel"
+ )
+@@ -49,6 +50,12 @@ func (this *ChannelTransferReadJob) CompareByteStreams(
+ 	byte_streams_1 []*encoding.ByteStream,
+ 	byte_streams_2 []*encoding.ByteStream,
+ ) {
++	// DaPPA recipes carry no reference outputs, so output verification is
++	// skipped when DAPPA_SKIP_VERIFY is set.
++	if os.Getenv("DAPPA_SKIP_VERIFY") != "" {
++		return
++	}
++
+ 	if len(byte_streams_1) != len(byte_streams_2) {
+ 		err := errors.New("byte streams 1's length != byte streams 2's length")
+ 		panic(err)

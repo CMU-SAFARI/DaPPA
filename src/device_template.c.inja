@@ -1,0 +1,504 @@
+#include <stdint.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <string.h>
+#include <defs.h>
+#include <mram.h>
+#include <alloc.h>
+#include <barrier.h>
+#include <handshake.h>
+#include <mutex.h>
+#include <perfcounter.h>
+
+#define TASKLET_LOG_FILTER 0
+//#define TASKLET_FILTER 0
+
+// Directly include the headers
+{% for header in headers %}
+    {{ header }}
+{% endfor %}
+
+// Architectural constants
+#define mramAlignment 8
+#define mramMaxTransferSize 2048
+typedef uint64_t MramAlignedType;
+
+uint32_t paddedSize(uint32_t size)
+{
+    // Only works if mramAlignment is 8
+    return (size + 7) & ~7;
+}
+
+uint32_t aligned(uint32_t size)
+{
+    // Only works if mramAlignment is 8
+    return size & ~7;
+}
+
+uint32_t min(uint32_t one, uint32_t two)
+{
+    return one < two ? one : two;
+}
+
+// MRAM transfers of arbitrary size, split into chunks of at most mramMaxTransferSize bytes
+void mram_write_full(void *src, __mram_ptr void *dst, uint32_t size)
+{
+    for (uint32_t offset = 0; size > 0; offset += mramMaxTransferSize, size -= min(size, mramMaxTransferSize))
+        mram_write((uint8_t*)src + offset, (__mram_ptr uint8_t*)dst + offset, min(size, mramMaxTransferSize));
+}
+
+void mram_read_full(__mram_ptr void *src, void *dst, uint32_t size)
+{
+    for (uint32_t offset = 0; size > 0; offset += mramMaxTransferSize, size -= min(size, mramMaxTransferSize))
+        mram_read((__mram_ptr uint8_t*)src + offset, (uint8_t*)dst + offset, min(size, mramMaxTransferSize));
+}
+
+// DPU versions of the lookup table accessors (the host versions are in dappa.h).
+// LOOKUP reads the 8-byte aligned window that contains the element from MRAM and
+// returns the element by value.
+#define LOOKUP_PTR(T) __mram_ptr T*
+#define LOOKUP(arr, idx) ({                                                       \
+    __dma_aligned MramAlignedType __lk_buf[(sizeof((arr)[0]) + 2 * mramAlignment) \
+                                           / sizeof(MramAlignedType)];            \
+    __mram_ptr uint8_t const *__lk_p = (__mram_ptr uint8_t const *)((arr) + (idx)); \
+    uint32_t __lk_off = (uint32_t)((uintptr_t)__lk_p & (mramAlignment - 1));       \
+    mram_read((__mram_ptr void const *)(__lk_p - __lk_off), __lk_buf,             \
+              paddedSize(__lk_off + sizeof((arr)[0])));                           \
+    __typeof__((arr)[0] + (arr)[0]) __lk_v;                                       \
+    __builtin_memcpy(&__lk_v, (uint8_t *)__lk_buf + __lk_off, sizeof((arr)[0]));  \
+    __lk_v;                                                                       \
+})
+
+// All kernel functions
+{% for kernel in stages %}
+    static inline
+    {% if kernel.isFilter %}
+        bool
+    {% else %}
+        void
+    {% endif %}
+    kernelFunc{{ loop.index }} {{ kernel.func }}
+{% endfor %}
+
+
+// Host inputs/outputs
+__host struct HostData hostData;
+
+{% for arg in args %}
+    // Filter output lengths
+    {% if arg.isFiltered %}
+        __host uint32_t filterOutputLengthArg{{ arg.index}}[NR_TASKLETS];
+    {% endif %}
+
+    // Padded variables for scalars. Reduce outputs have R accumulator banks, which are
+    // guarded by a mutex if R < NR_TASKLETS. Read-only scalars are stored only once to
+    // save WRAM.
+    {% if arg.isScalar %}
+        {% if arg.isOutput %}
+            __host uint8_t argScalarRaw{{ arg.index }}[{{ arg.replicationFactor }}][{{ arg.elementSize }}];
+            {% if arg.isReduceShared %}
+                uint8_t __atomic_bit reduceMutexArg{{ arg.index }}[{{ arg.replicationFactor }}] = {0};
+            {% endif %}
+        {% else %}
+            __host uint8_t argScalarRaw{{ arg.index }}[1][{{ arg.elementSize }}];
+        {% endif %}
+    {% endif %}
+
+    // Scan state. Each launch scans in two passes:
+    //  1. Every tasklet scans its contiguous region and records its total.
+    //  2. Tasklet 0 computes the per-tasklet offsets and the total of the DPU
+    //     (scanChunkSumArg), then every tasklet adds its offset to its region.
+    // The host combines the totals of all DPUs and rounds afterwards.
+    {% if arg.isScanned %}
+        {{ arg.type }} scanTaskletFinalArg{{ arg.index }}[NR_TASKLETS];
+        {{ arg.type }} scanTaskletOffsetArg{{ arg.index }}[NR_TASKLETS];
+        __host {{ arg.type }} scanChunkSumArg{{ arg.index }};
+        BARRIER_INIT(scanBarrierArg{{ arg.index }}, NR_TASKLETS);
+    {% endif %}
+{% endfor %}
+
+// Synchronization for memory initialization
+BARRIER_INIT(memInitBarrier, NR_TASKLETS);
+
+
+int main()
+{
+    uint32_t taskletIndex = me();
+    uint32_t taskletElementCount;
+    uint32_t mramIndexIn;
+    uint32_t mramIndexOut;
+    uint32_t cacheIndex;
+    uint32_t cacheIndexGroup;
+    uint32_t filterCacheIndex;
+    uint32_t filterMramOffset;
+    uint32_t elementsLeft;
+    uint32_t elementsThisBlock;
+    uint32_t filterCacheOffset;
+    uint32_t dpuRegionElements;
+    uint32_t blockStartElems;
+
+#ifdef MEASURE_PERFORMANCE_DPU
+    perfcounter_config(COUNT_CYCLES, true);
+#endif
+
+    DEBUG_DPU("tasklet count: %d  additional: %d  size: %d", hostData.taskletElementCount, hostData.additionalElementTaskletCount, sizeof(hostData));
+
+    // Initialize the memory if needed
+    if(taskletIndex == 0)
+        mem_reset();
+    barrier_wait(&memInitBarrier);
+
+    TIME_DPU("Memory init");
+
+#ifdef TASKLET_FILTER
+    if (taskletIndex != TASKLET_FILTER)
+        return 0;
+#endif
+
+    taskletElementCount = hostData.taskletElementCount;
+    // Special case for the very end of the data
+    if (taskletIndex < hostData.additionalElementTaskletCount)
+        taskletElementCount++;
+
+    {% for arg in args %}
+        // Reset the output sizes
+        {% if arg.isFiltered %}
+            filterOutputLengthArg{{ arg.index}}[taskletIndex] = taskletElementCount;
+        {% endif %}
+
+        // Get the correct scalar args. Reduce outputs use bank taskletIndex % R, read-only
+        // scalars only have a single copy.
+        {% if arg.isScalar %}
+            {% if arg.isOutput %}
+                {{ arg.type }} *argScalar{{ arg.index }} = ({{ arg.type }}*)(&argScalarRaw{{ arg.index }}[taskletIndex % {{ arg.replicationFactor }}]);
+            {% else %}
+                {{ arg.type }} *argScalar{{ arg.index }} = ({{ arg.type }}*)(&argScalarRaw{{ arg.index }}[0]);
+            {% endif %}
+        {% endif %}
+    {% endfor %}
+
+    // Allocate a WRAM cache for the args
+    __dma_aligned uint8_t *cache = mem_alloc({{ cacheSize }});
+
+    // Calculate the start of our MRAM block
+    uint32_t mramStartIndex;
+    if (taskletIndex < hostData.additionalElementTaskletCount)
+        mramStartIndex = taskletIndex * taskletElementCount;
+    else
+        mramStartIndex = hostData.additionalElementTaskletCount * (taskletElementCount + 1) + (taskletIndex - hostData.additionalElementTaskletCount) * taskletElementCount;
+
+    DEBUG_DPU("Tasklet start (elements: %d, stack: %d, mram: %p+%d)", taskletElementCount, check_stack(), DPU_MRAM_HEAP_POINTER, mramStartIndex);
+
+    // Correctly type the cache MRAM pointers for every argument
+    {% for arg in args %}
+        {{ arg.type }} *argCache{{ arg.index }};
+        __mram_ptr {{ arg.type }} *argMramPtr{{ arg.index }} = (__mram_ptr {{ arg.type }} *)
+                                                                ((__mram_ptr uint8_t*)(DPU_MRAM_HEAP_POINTER) + {{ arg.mramOffset }});
+    {% endfor %}
+
+    TIME_DPU("Arg init");
+
+    {% for kernel in stages %}
+        // Reset memory offsets for each stage
+        mramIndexIn = mramStartIndex / {{ kernel.inputLengthFraction }};
+        mramIndexOut = mramStartIndex / {{ kernel.outputLengthFraction }};
+        filterMramOffset = {{ kernel.filterOutput.mramOffset }} + (mramStartIndex / {{ kernel.outputLengthFraction }}) * {{ kernel.filterOutput.elementSize }};
+        cacheIndex = 0;
+        filterCacheIndex = 0;
+        filterCacheOffset = 0;
+
+        DEBUG_DPU("-----------------");
+        DEBUG_DPU("Starting stage {{ loop.index }}");
+
+        // Get the correct input element count
+        {% if kernel.filterInputIndex >= 0 %}
+            elementsLeft = filterOutputLengthArg{{ kernel.filterInputIndex }}[taskletIndex];
+        {% else %}
+            elementsLeft = taskletElementCount / {{ kernel.inputLengthFraction }} + {{kernel.alignmentOverlap }} * {{ kernel.groupSize}} + {{ kernel.stageOverlap }};
+        {% endif %}
+
+        // Filters will fill up that value themselves
+        {% if kernel.isFilter %}
+            filterOutputLengthArg{{ kernel.filterOutput.index }}[taskletIndex] = 0;
+        {% endif %}
+
+        // Initialize the base cache pointers
+        {% for arg in kernel.args %}
+            argCache{{ arg.index }} = ({{ arg.type }}*)(cache + {{ arg.cacheOffset }});
+        {% endfor %}
+
+        // Keep private reduce accumulators of up to 8 bytes in a local variable, so the
+        // compiler can hold them in registers (argScalar may alias the cache). They are
+        // written back to their WRAM bank after the stage.
+        {% for arg in kernel.args %}
+            {% if arg.isScalar and arg.isOutput and not arg.isReduceShared and arg.elementSize <= 8 %}
+                {{ arg.type }} reduceLocal{{ arg.index }} = *argScalar{{ arg.index }};
+            {% endif %}
+        {% endfor %}
+
+        {% if kernel.isScan %}
+            // Running scan value of this tasklet, starting from the identity element
+            {{ kernel.scanOutputType }} tasklet_running;
+            memset(&tasklet_running, 0, sizeof({{ kernel.scanOutputType }}));
+        {% endif %}
+
+        TIME_DPU("Stage init");
+
+        {% if kernel.interleaved %}
+        // Interleaved indexing: tasklet t processes blocks t, t + NR_TASKLETS, ..., which keeps
+        // the tasklets out of phase so their MRAM transfers overlap instead of running in lockstep
+        dpuRegionElements = NR_TASKLETS * hostData.taskletElementCount + hostData.additionalElementTaskletCount;
+        for (blockStartElems = taskletIndex * {{ interleaveBlock }};
+             blockStartElems < dpuRegionElements;
+             blockStartElems += {{ interleaveBlock }} * NR_TASKLETS)
+        {
+            elementsThisBlock = min(dpuRegionElements - blockStartElems, {{ interleaveBlock }});
+            mramIndexIn = blockStartElems;
+            mramIndexOut = blockStartElems;
+        {% else %}
+        while (elementsLeft > 0)
+        {
+            // Process the elements of one cache block
+            elementsThisBlock = min(elementsLeft, {{ kernel.cacheElementCount }});
+        {% endif %}
+
+            DEBUG_DPU("Starting block (size: %d)", elementsThisBlock);
+
+            TIME_DPU("Block init");
+
+            // Read inputs to caches
+            {% for arg in kernel.args %}
+                {% if arg.isInput and arg.isVector %}
+                    DEBUG_DPU("Reading input: M+%d -> C+%d (size %d, inputOverlap %d)",
+                              {{ arg.mramOffset }} + mramIndexIn,
+                              {{ arg.cacheOffset }},
+                              paddedSize({{ arg.elementSize }} * (elementsThisBlock + {{ arg.inputOverlap }})),
+                              {{ arg.inputOverlap }});
+                    mram_read_full(argMramPtr{{ arg.index }} + mramIndexIn,
+                                   argCache{{ arg.index }},
+                                   paddedSize({{ arg.elementSize }} * (elementsThisBlock + {{ arg.inputOverlap }})));
+                {% endif %}
+            {% endfor %}
+
+            TIME_DPU("Copy Inputs");
+
+            {% if kernel.isScan %}
+                // Scan pass 1: local scan over the region of this tasklet
+                #pragma unroll 8
+                for (cacheIndex = 0; cacheIndex < elementsThisBlock; cacheIndex++)
+                {
+                    argCache{{ kernel.scanOutputIndex }}[cacheIndex] = tasklet_running;
+                    kernelFunc{{ loop.index }}(
+                        &argCache{{ kernel.scanOutputIndex }}[cacheIndex],
+                        &argCache{{ kernel.scanInputIndex }}[cacheIndex]);
+                    tasklet_running = argCache{{ kernel.scanOutputIndex }}[cacheIndex];
+                }
+            {% else %}
+            {% if kernel.groupSize > 1 %}
+                cacheIndexGroup = 0;
+            {% endif %}
+            // Partially unroll the per-element loop to reduce loop overhead
+            #pragma unroll 8
+            for (cacheIndex = 0; cacheIndex < elementsThisBlock; cacheIndex += {{ kernel.groupSize }})
+            {
+                // Capture the result of the kernel if it is a filter
+                {% if kernel.isFilter %}
+                    bool keep =
+                {% endif %}
+
+                // Shared reduce accumulator banks must be locked
+                {% for arg in kernel.args %}
+                    {% if arg.isReduceShared %}
+                        mutex_lock(&reduceMutexArg{{ arg.index }}[taskletIndex % {{ arg.replicationFactor }}]);
+                    {% endif %}
+                {% endfor %}
+
+                // Run the kernel
+                kernelFunc{{ loop.index }}(
+                    {% for arg in kernel.args %}
+                        {% if arg.isScalar %}
+                            {% if arg.isOutput and not arg.isReduceShared and arg.elementSize <= 8 %}
+                                &reduceLocal{{ arg.index }}
+                            {% else %}
+                                argScalar{{ arg.index }}
+                            {% endif %}
+                        {% else if arg.isLookup %}
+                            argMramPtr{{ arg.index }}
+                        {% else if arg.isVector %}
+                            {% if arg.isOutput and kernel.groupSize > 1 %}
+                                argCache{{ arg.index }} + cacheIndexGroup
+                            {% else %}
+                                argCache{{ arg.index }} + cacheIndex
+                            {% endif %}
+                        {% endif %}
+                        {% if not loop.is_last %}
+                            ,
+                        {% endif %}
+                    {% endfor %}
+                );
+
+                {% for arg in kernel.args %}
+                    {% if arg.isReduceShared %}
+                        mutex_unlock(&reduceMutexArg{{ arg.index }}[taskletIndex % {{ arg.replicationFactor }}]);
+                    {% endif %}
+                {% endfor %}
+
+                {% if kernel.groupSize > 1 %}
+                    cacheIndexGroup++;
+                {% endif %}
+
+                // Copy the filter output
+                DEBUG_DPU_VV("--- cacheIndex = %d ---", cacheIndex);
+                {% if kernel.isFilter %}
+                    if (keep)
+                    {
+                        DEBUG_DPU_VV("Keeping result @ %d -> %d: %d", cacheIndex, filterCacheIndex, argCache{{ kernel.firstArg.index }}[cacheIndex]);
+                        (({{ kernel.filterOutput.type }}*)(cache + {{ kernel.filterOutput.cacheOffset }} + filterCacheOffset))[filterCacheIndex]
+                            = argCache{{ kernel.firstArg.index }}[cacheIndex];
+                        filterCacheIndex++;
+                    }
+                    else
+                    {
+                        DEBUG_DPU_VV("Discarding result @ %d: %d", cacheIndex, argCache{{ kernel.firstArg.index }}[cacheIndex]);
+                    }
+                {% endif %}
+
+                // Debug output
+                {% for arg in kernel.args %}
+                    {% if arg.isScalar %}
+                        {# Change to true for struct types #}
+                        {% if false %}
+                            DEBUG_DPU_VV("Scalar: %d %ld", argScalar{{ arg.index }}->length, argScalar{{ arg.index }}->sum);
+                        {% else %}
+                            DEBUG_DPU_VV("Scalar: %d", *argScalar{{ arg.index }});
+                        {% endif %}
+                    {% else %}
+                        {# Change to true for struct types #}
+                        {% if false %}
+                            DEBUG_DPU_VV("Vector: %d %d", (argCache{{ arg.index }} + cacheIndex)->a, (argCache{{ arg.index }} + cacheIndex)->b);
+                        {% else %}
+                            DEBUG_DPU_VV("Vector: %d", *(argCache{{ arg.index }} + cacheIndex));
+                        {% endif %}
+                    {% endif %}
+                {% endfor %}
+            }
+            {% endif %}
+
+            TIME_DPU("Process block");
+
+            // Write outputs back to MRAM
+            {% for arg in kernel.args %}
+                {% if arg.isOutput and arg.isVector and arg.index != kernel.filterOutput.index %}
+                    DEBUG_DPU("Writing output: C+%d -> M+%d (size %d, groupSize %d)",
+                              {{ arg.cacheOffset }},
+                              {{ arg.mramOffset }} + mramIndexOut,
+                              aligned({{ arg.elementSize }} * (elementsThisBlock / {{ kernel.groupSize }})),
+                              {{ kernel.groupSize }});
+
+                    // Aligned, not padded as everything is aligned except the last tasklet, which we
+                    // account for with the alignmentOverlap
+                    mram_write_full(argCache{{ arg.index }},
+                                    argMramPtr{{ arg.index }} + mramIndexOut,
+                                    aligned({{ arg.elementSize }} * (elementsThisBlock / {{ kernel.groupSize }})));
+                {% endif %}
+                {% if arg.isScalar %}
+                    DEBUG_DPU_VV("Scalar output arg %d: %d", {{ arg.index }}, *argScalar{{ arg.index }});
+                {% endif %}
+            {% endfor %}
+
+            TIME_DPU("Writing outputs");
+
+            {% if kernel.isFilter %}
+                DEBUG_DPU("Writing filter output: C+%d -> M+%d (length: %d, size: %d, offset: %d)",
+                          {{ kernel.filterOutput.cacheOffset }},
+                          filterMramOffset,
+                          filterCacheIndex,
+                          paddedSize({{ kernel.filterOutput.elementSize }} * filterCacheIndex + filterCacheOffset),
+                          filterCacheOffset);
+
+                mram_write_full(cache + {{ kernel.filterOutput.cacheOffset }}, // Not using argCache as the filter output has its own cache
+                                (__mram_ptr uint8_t*)(DPU_MRAM_HEAP_POINTER) + filterMramOffset,
+                                paddedSize({{ kernel.filterOutput.elementSize }} * filterCacheIndex + filterCacheOffset));
+
+                // Add the number of filtered elements to the running total
+                filterOutputLengthArg{{ kernel.filterOutput.index }}[taskletIndex] += filterCacheIndex;
+                DEBUG_DPU("Filter output length arg %d: %d", {{ kernel.filterOutput.index }}, filterOutputLengthArg{{ kernel.filterOutput.index }}[taskletIndex]);
+
+                // Filter output is not aligned, so we have to account for overlap
+                *((MramAlignedType*)(cache + {{ kernel.filterOutput.cacheOffset }}))
+                 = *((MramAlignedType*)(cache + {{ kernel.filterOutput.cacheOffset }}
+                                        + aligned(filterCacheOffset + filterCacheIndex * {{kernel.filterOutput.elementSize }})));
+
+                // Advance filter indices
+                filterMramOffset += aligned(filterCacheOffset + filterCacheIndex * {{kernel.filterOutput.elementSize }});
+                // Note that this only works as long as mramAlignment is 8
+                filterCacheOffset = (filterCacheOffset + {{ kernel.filterOutput.elementSize }} * filterCacheIndex) & 7;
+                filterCacheIndex = 0;
+            {% endif %}
+
+            TIME_DPU("Writing filter output");
+
+            {% if not kernel.interleaved %}
+            // Next cache block
+            elementsLeft -= elementsThisBlock;
+            mramIndexIn += elementsThisBlock;
+            mramIndexOut += elementsThisBlock / {{ kernel.groupSize }};
+            {% endif %}
+        }
+
+        // Write the local reduce accumulators back to WRAM
+        {% for arg in kernel.args %}
+            {% if arg.isScalar and arg.isOutput and not arg.isReduceShared and arg.elementSize <= 8 %}
+                *argScalar{{ arg.index }} = reduceLocal{{ arg.index }};
+            {% endif %}
+        {% endfor %}
+
+        {% if kernel.isScan %}
+            // Compute the offset of every tasklet and the total of this DPU. Offsets across
+            // DPUs and rounds are applied by the host.
+            scanTaskletFinalArg{{ kernel.scanOutputIndex }}[taskletIndex] = tasklet_running;
+            barrier_wait(&scanBarrierArg{{ kernel.scanOutputIndex }});
+
+            if (taskletIndex == 0) {
+                {{ kernel.scanOutputType }} offset;
+                memset(&offset, 0, sizeof({{ kernel.scanOutputType }}));  // Identity element
+                for (uint32_t t = 0; t < NR_TASKLETS; t++) {
+                    scanTaskletOffsetArg{{ kernel.scanOutputIndex }}[t] = offset;
+                    kernelFunc{{ loop.index }}(&offset, &scanTaskletFinalArg{{ kernel.scanOutputIndex }}[t]);
+                }
+                // offset now holds the total of this DPU
+                scanChunkSumArg{{ kernel.scanOutputIndex }} = offset;
+            }
+            barrier_wait(&scanBarrierArg{{ kernel.scanOutputIndex }});
+
+            // Scan pass 2: add the offset of this tasklet to its region
+            {{ kernel.scanOutputType }} pass2_offset = scanTaskletOffsetArg{{ kernel.scanOutputIndex }}[taskletIndex];
+            elementsLeft = taskletElementCount / {{ kernel.inputLengthFraction }} + {{kernel.alignmentOverlap }} * {{ kernel.groupSize}} + {{ kernel.stageOverlap }};
+            mramIndexOut = mramStartIndex / {{ kernel.outputLengthFraction }};
+
+            while (elementsLeft > 0) {
+                elementsThisBlock = min(elementsLeft, {{ kernel.cacheElementCount }});
+
+                mram_read_full(argMramPtr{{ kernel.scanOutputIndex }} + mramIndexOut,
+                               argCache{{ kernel.scanOutputIndex }},
+                               paddedSize({{ kernel.scanOutputArg.elementSize }} * elementsThisBlock));
+
+                #pragma unroll 8
+                for (cacheIndex = 0; cacheIndex < elementsThisBlock; cacheIndex++) {
+                    {{ kernel.scanOutputType }} tmp = pass2_offset;
+                    kernelFunc{{ loop.index }}(&tmp, &argCache{{ kernel.scanOutputIndex }}[cacheIndex]);
+                    argCache{{ kernel.scanOutputIndex }}[cacheIndex] = tmp;
+                }
+
+                mram_write_full(argCache{{ kernel.scanOutputIndex }},
+                                argMramPtr{{ kernel.scanOutputIndex }} + mramIndexOut,
+                                aligned({{ kernel.scanOutputArg.elementSize }} * elementsThisBlock));
+
+                elementsLeft -= elementsThisBlock;
+                mramIndexOut += elementsThisBlock;
+            }
+        {% endif %}
+    {% endfor %}
+
+    return 0;
+}

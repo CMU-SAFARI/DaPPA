@@ -1,0 +1,21 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# uPIMulator checkout created by integrations/upimulator/setup.sh
+integrations/upimulator/uPIMulator/
+
+# Outputs of the tests and scripts
+result.txt
+measurement_fw_*.txt
+bbop_statistics.csv
+
+# Editors
+.idea/
+.vscode/
+*.swp
